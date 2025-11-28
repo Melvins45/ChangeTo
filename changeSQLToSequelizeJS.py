@@ -330,11 +330,27 @@ class SQLToSequelizeApp:
                 if col in tables[tbl].get('columns', {}):
                     tables[tbl]['columns'][col]['autoIncrement'] = True
 
+            # Find MODIFY ... NOT NULL occurrences
+            for not_null_match in re.finditer(r"MODIFY\s+`?(\w+)`?\s+\w+(?:\(\d+\))?\s+NOT NULL", content, re.I):
+                col = not_null_match.group(1)
+                if col in tables[tbl].get('columns', {}):
+                    tables[tbl]['columns'][col]['nullable'] = False
+
             # Find ADD PRIMARY KEY (...) in ALTER
             pk_match = re.search(r"ADD PRIMARY KEY\s*\((.*?)\)", content, re.I)
             if pk_match:
                 pks = [c.strip("` \"") for c in pk_match.group(1).split(',')]
                 tables[tbl]['primaryKeys'] = pks
+                # Mark PK columns as NOT NULL
+                for pk_col in pks:
+                    if pk_col in tables[tbl].get('columns', {}):
+                        tables[tbl]['columns'][pk_col]['nullable'] = False
+
+        # Ensure all primary key columns are NOT NULL
+        for tbl, tbl_data in tables.items():
+            for pk_col in tbl_data.get('primaryKeys', []):
+                if pk_col in tbl_data.get('columns', {}):
+                    tbl_data['columns'][pk_col]['nullable'] = False
 
         # Create temporary directories
         temp_dir = "generated_sequelize"
