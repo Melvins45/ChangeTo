@@ -177,18 +177,6 @@ class SQLToSequelizeApp:
             
             migration += f"      }},\n"
         
-        # Add foreign keys
-        for col_name, fk_info in foreign_keys.items():
-            migration += f"      {col_name}: {{\n"
-            migration += f"        type: Sequelize.INTEGER,\n"
-            migration += f"        references: {{\n"
-            migration += f"          model: '{fk_info['table']}',\n"
-            migration += f"          key: '{fk_info['column']}'\n"
-            migration += f"        }},\n"
-            migration += f"        onUpdate: 'CASCADE',\n"
-            migration += f"        onDelete: 'SET NULL',\n"
-            migration += f"        allowNull: true\n"
-            migration += f"      }},\n"
         
         migration += f"      createdAt: {{\n"
         migration += f"        type: Sequelize.DATE,\n"
@@ -210,6 +198,29 @@ class SQLToSequelizeApp:
         
         return migration
 
+    def generate_fk_migration(self, table_name: str, col_name: str, fk_info: dict) -> str:
+        """Generate a separate migration that adds a foreign key constraint for a given column"""
+        fk_name = f"fk_{table_name}_{col_name}_{fk_info['table']}_{fk_info['column']}"
+        migration = f"'use strict';\n\nmodule.exports = {{\n"
+        migration += f"  async up(queryInterface, Sequelize) {{\n"
+        migration += f"    await queryInterface.addConstraint('{table_name}', {{\n"
+        migration += f"      fields: ['{col_name}'],\n"
+        migration += f"      type: 'foreign key',\n"
+        migration += f"      name: '{fk_name}',\n"
+        migration += f"      references: {{\n"
+        migration += f"        table: '{fk_info['table']}',\n"
+        migration += f"        field: '{fk_info['column']}'\n"
+        migration += f"      }},\n"
+        migration += f"      onUpdate: 'CASCADE',\n"
+        migration += f"      onDelete: 'SET NULL'\n"
+        migration += f"    }});\n"
+        migration += f"  }},\n\n"
+        migration += f"  async down(queryInterface) {{\n"
+        migration += f"    await queryInterface.removeConstraint('{table_name}', '{fk_name}');\n"
+        migration += f"  }}\n"
+        migration += f"}};\n"
+        return migration
+
     def generate_model_file(self, table_name: str, table_data: dict) -> str:
         """Generate model file content for a single table"""
         columns = table_data["columns"]
@@ -223,12 +234,15 @@ class SQLToSequelizeApp:
         model += f"module.exports = (sequelize, DataTypes) => {{\n"
         model += f"  class {model_class_name} extends Model {{\n"
         model += f"    static associate(models) {{\n"
-        
-        # Add associations for foreign keys
+
+        # Add associations for foreign keys (belongsTo) and suggest inverse (hasMany)
         for col_name, fk_info in foreign_keys.items():
             ref_model = fk_info['table'][0].upper() + fk_info['table'][1:].lower()
-            model += f"      // this.hasMany(models.{ref_model}, {{ foreignKey: '{col_name}' }});\n"
-        
+            # the model that has the FK belongsTo the referenced model
+            model += f"      this.belongsTo(models.{ref_model}, {{ foreignKey: '{col_name}' }});\n"
+            # suggest inverse relationship in the referenced model (commented)
+            model += f"      // In models/{fk_info['table']}.js consider: this.hasMany(models.{model_class_name}, {{ foreignKey: '{col_name}' }});\n"
+
         model += f"    }}\n"
         model += f"  }}\n"
         model += f"  {model_class_name}.init({{\n"
@@ -249,8 +263,10 @@ class SQLToSequelizeApp:
                 model += f"      allowNull: true\n"
             model += f"    }},\n"
         
-        # Add foreign keys
+        # Add foreign keys only if column not already defined above
         for col_name, fk_info in foreign_keys.items():
+            if col_name in columns:
+                continue
             model += f"    {col_name}: {{\n"
             model += f"      type: DataTypes.INTEGER,\n"
             model += f"      references: {{\n"
@@ -280,27 +296,61 @@ class SQLToSequelizeApp:
         table_pattern = re.compile(r"CREATE TABLE\s+`?(\w+)`?\s*\((.*?)\)\s*(?:ENGINE=.*?;|;)", re.S | re.I)
         
         matches = table_pattern.findall(sql)
-        
+
         if not matches:
             messagebox.showerror("Error", "No CREATE TABLE statements found!")
             return None
-        
+
+        # Build initial table data from CREATE TABLE bodies
+        tables = {}
+        for table_name, body in matches:
+            tables[table_name] = self.parse_create_table(body)
+
+        # Parse ALTER TABLE statements to capture FK constraints, PKs, and AUTO_INCREMENT set via ALTER
+        alter_pattern = re.compile(r"ALTER TABLE\s+`?(\w+)`?\s+(.*?);", re.S | re.I)
+        for tbl, content in alter_pattern.findall(sql):
+            content = content.strip()
+            if tbl not in tables:
+                # initialize an empty table entry if ALTER references table not in CREATEs
+                tables.setdefault(tbl, {"columns": {}, "primaryKeys": [], "foreignKeys": {}})
+
+            # Find FOREIGN KEY references inside ALTER content
+            for fk_match in re.finditer(r"FOREIGN KEY\s*\((`?\w+`?)\)\s*REFERENCES\s*`?(\w+)`?\s*\((`?\w+`?)\)", content, re.I):
+                col = fk_match.group(1).strip("`\"'")
+                ref_table = fk_match.group(2).strip("`\"'")
+                ref_col = fk_match.group(3).strip("`\"'")
+                tables[tbl].setdefault('foreignKeys', {})[col] = {"table": ref_table, "column": ref_col}
+                # if the FK column was not declared in the CREATE TABLE, add a default INT column entry
+                if col not in tables[tbl].get('columns', {}):
+                    tables[tbl].setdefault('columns', {})[col] = {"type": "INT", "size": None, "nullable": True, "autoIncrement": False}
+
+            # Find MODIFY ... AUTO_INCREMENT occurrences
+            for mod in re.finditer(r"MODIFY\s+`?(\w+)`?.*?AUTO_INCREMENT", content, re.I):
+                col = mod.group(1)
+                if col in tables[tbl].get('columns', {}):
+                    tables[tbl]['columns'][col]['autoIncrement'] = True
+
+            # Find ADD PRIMARY KEY (...) in ALTER
+            pk_match = re.search(r"ADD PRIMARY KEY\s*\((.*?)\)", content, re.I)
+            if pk_match:
+                pks = [c.strip("` \"") for c in pk_match.group(1).split(',')]
+                tables[tbl]['primaryKeys'] = pks
+
         # Create temporary directories
         temp_dir = "generated_sequelize"
         migrations_dir = os.path.join(temp_dir, "migrations")
         models_dir = os.path.join(temp_dir, "models")
-        
+
         # Clean up if exists
         if os.path.exists(temp_dir):
             import shutil
             shutil.rmtree(temp_dir)
-        
+
         os.makedirs(migrations_dir, exist_ok=True)
         os.makedirs(models_dir, exist_ok=True)
-        
+
         # Generate files for each table
-        for table_name, body in matches:
-            table_data = self.parse_create_table(body)
+        for table_name, table_data in tables.items():
             
             # Generate migration file
             migration_content = self.generate_migration_file(table_name, table_data)
@@ -313,6 +363,13 @@ class SQLToSequelizeApp:
             model_filename = f"{table_name}.js"
             with open(os.path.join(models_dir, model_filename), "w", encoding="utf-8") as f:
                 f.write(model_content)
+            
+            # Generate separate FK migrations (one per foreign key)
+            for col_name, fk_info in table_data.get('foreignKeys', {}).items():
+                fk_migration_content = self.generate_fk_migration(table_name, col_name, fk_info)
+                fk_migration_filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-add-fk-{table_name}-{col_name}.js"
+                with open(os.path.join(migrations_dir, fk_migration_filename), "w", encoding="utf-8") as fkf:
+                    fkf.write(fk_migration_content)
         
         # Create ZIP file
         zip_filename = f"sequelize-generated-{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
@@ -331,6 +388,25 @@ class SQLToSequelizeApp:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = SQLToSequelizeApp(root)
-    root.mainloop()
+    import sys
+    # Headless mode: pass a SQL file path as first argument to generate ZIP without GUI
+    if len(sys.argv) > 1:
+        sql_path = sys.argv[1]
+        if not os.path.exists(sql_path):
+            print(f"SQL file not found: {sql_path}")
+            sys.exit(1)
+        with open(sql_path, 'r', encoding='utf-8') as f:
+            sql = f.read()
+        # instantiate without running __init__ to avoid creating GUI
+        app = SQLToSequelizeApp.__new__(SQLToSequelizeApp)
+        zipfile_path = app.sql_to_sequelize(sql)
+        if zipfile_path:
+            print(f"Generated: {zipfile_path}")
+            sys.exit(0)
+        else:
+            print("Generation failed.")
+            sys.exit(2)
+    else:
+        root = tk.Tk()
+        app = SQLToSequelizeApp(root)
+        root.mainloop()
